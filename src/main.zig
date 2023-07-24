@@ -141,7 +141,7 @@ const Editor = struct {
             line_start += 1;
         }
 
-        line_start += 1;
+        if(line_count != 0) line_start += 1;
 
         while (line_start+line_length < self.buffer.items.len) {
             if(self.buffer.items[line_start+line_length] == '\r') break;
