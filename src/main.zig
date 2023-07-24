@@ -16,7 +16,10 @@ const Editor = struct {
 
     buffer: std.ArrayList(u8),
     cursor: usize,
+    line_count: usize = 0,
     tty: fs.File = undefined,
+    tty_w: usize = undefined,
+    tty_h: usize = undefined,
     orig_termios: os.termios = undefined,
     curr_termios: os.termios = undefined,
 
@@ -82,16 +85,36 @@ const Editor = struct {
         try bw.flush();
     }
 
+    pub fn tty_cursor_move(writer: anytype, row: usize, col: usize) !void {
+        _ = try writer.print("\x1B[{};{}H",.{row + 1, col + 1});
+    }
+
+    pub fn get_tty_size(self: *Self) !void {
+        var size = std.mem.zeroInit(os.system.winsize, .{});
+        const err = os.system.ioctl(self.tty.handle, os.system.T.IOCGWINSZ,@intFromPtr(&size));
+        if(os.errno(err) != .SUCCESS) return os.unexpectedErrno(@enumFromInt(err));
+        self.tty_h = size.ws_row;
+        self.tty_w = size.ws_col;
+    }
+
     pub fn cursor_move(self: *Self, index: usize) !void {
         if (index > self.buffer.items.len) return error.cursor_outside_buffer;
         self.cursor = index;
     }
 
     pub fn delete(self: *Self) !void {
+        var line_removed: bool = false;
+        while(self.cursor != 0 and (self.buffer.items[self.cursor-1] == '\n' or self.buffer.items[self.cursor-1] == '\n')) : (self.cursor -= 1) {
+            _ = self.buffer.orderedRemove(self.cursor-1);
+            line_removed = true;
+        }
         if (self.cursor != 0) {
             self.cursor -= 1;
             _ = self.buffer.orderedRemove(self.cursor);
         }
+        if(self.cursor != 0 and line_removed) self.line_count -= 1;
+            
+
     }
 
     pub fn insert(self: *Self, char: u8) !void {
@@ -105,6 +128,27 @@ const Editor = struct {
 
     pub fn insertSlice(self: *Self, slice: []const u8) !void {
         for (slice) |char| try self.insert(char);
+    }
+
+    pub fn get_line_length(self: *Self) usize {
+        var line_start: usize = 0;
+        var line_length: usize = 0;
+        var line_count: usize = 0;
+        
+        while (line_start < self.buffer.items.len) {
+            if(self.line_count == line_count) break;
+            if(self.buffer.items[line_start] == '\r') line_count += 1;
+            line_start += 1;
+        }
+
+        line_start += 1;
+
+        while (line_start+line_length < self.buffer.items.len) {
+            if(self.buffer.items[line_start+line_length] == '\r') break;
+            line_length += 1;
+        }
+
+        return line_length;
     }
 
     pub fn loop(self: *Self) !void {
@@ -137,10 +181,17 @@ const Editor = struct {
                     }
                 },
                 '\x08', '\x7F' => try self.delete(),
-                '\x0D' => try self.insertSlice("\r\n"),
+                '\x0D' => {
+                    try self.insertSlice("\r\n");
+                    self.line_count += 1;
+                },
                 else => try self.insert(buffer[0]),
             }
             try stdout.print("{s}{s}{s}", .{ Self.ClearScreen, Self.ResetCursor, self.buffer.items });
+            try self.get_tty_size();
+            try Self.tty_cursor_move(stdout,self.tty_h,0);
+            try stdout.print("CURSOR POS: {d} BUFFER SIZE: {d} LINE COUNT: {d} LINE LENGTH: {d}", .{self.cursor, self.buffer.items.len, self.line_count, self.get_line_length()});
+            try Self.tty_cursor_move(stdout,self.line_count,self.get_line_length());
             try bw.flush();
         }
     }
