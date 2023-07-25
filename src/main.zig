@@ -25,11 +25,31 @@ const Editor = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator) !Self {
+    pub fn init(allocator: Allocator, file_path: ?[]const u8) !Self {
         var self: Self = .{
             .buffer = std.ArrayList(u8).init(allocator),
             .cursor = 0,
         };
+
+        if (file_path) |path| {
+            const file = try fs.cwd().openFile(path, .{.mode = .read_only});
+            defer file.close();
+
+            const file_stat = try file.stat();
+            const file_size = file_stat.size;
+            const text = try file.readToEndAlloc(allocator, file_size);
+            
+            for (text) |char| {
+                if (char == '\n') {
+                    try self.buffer.append('\r');
+                    self.line_count += 1;
+                }
+                try self.buffer.append(char);
+            }
+            self.cursor = self.buffer.items.len;
+
+            //if (file_len != read_len) return error.error_reading_file;
+        }
 
         const stdout_file = std.io.getStdOut().writer();
         var bw = std.io.bufferedWriter(stdout_file);
@@ -62,8 +82,7 @@ const Editor = struct {
         try os.tcsetattr(self.tty.handle, .FLUSH, self.curr_termios);
 
         try stdout.writeAll(Editor.AltBuffer);
-        try stdout.writeAll(Editor.ClearScreen);
-        try stdout.writeAll(Editor.ResetCursor);
+        try stdout.print("{s}{s}{s}", .{ Self.ClearScreen, Self.ResetCursor, self.buffer.items });
         try bw.flush();
 
         return self;
@@ -198,20 +217,25 @@ const Editor = struct {
 };
 
 pub fn main() !void {
-
     //Allocator setup
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var editor = try Editor.init(allocator);
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    _ = args.skip();
+
+    var editor = try Editor.init(allocator, args.next());
     try editor.loop();
     try editor.deinit();
 }
 
 test "Editor - overflow" {
-    var editor = try Editor.init(std.testing.allocator);
-    defer editor.deinit();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    var editor = try Editor.init(allocator, "LICENSE");
 
     try editor.insert('A');
     try editor.insert('B');
@@ -225,5 +249,6 @@ test "Editor - overflow" {
     try editor.cursor_move(1);
     try editor.delete();
 
-    std.debug.print("{s}{s}{s}", .{ Editor.ClearScreen, Editor.ResetCursor, editor.buffer.items });
+    try editor.deinit();
+    try std.testing.expect(gpa.deinit() == .ok);
 }
