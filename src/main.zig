@@ -89,14 +89,7 @@ const Editor = struct {
 
         const writer = self.tty.writer();
         try writer.writeAll(Editor.AltBuffer);
-        try writer.print("{s}{s}", .{ Self.ClearScreen, Self.ResetCursor });
-        for (self.buffer.items) |line| {
-            try writer.print("{s}\r\n", .{line.items});
-        }
-        try self.get_tty_size();
-        try Self.tty_cursor_move(writer, self.tty_h, 0);
-        try writer.print("CURSOR POS: {d}x {d}y BUFFER SIZE: {d} LINE COUNT: {d} LINE LENGTH: {d}", .{ self.cursor_x, self.cursor_y, self.get_buffer_size(), self.line_count, self.get_line_length() });
-        try Self.tty_cursor_move(writer, self.cursor_y, self.cursor_x);
+        try self.draw_buffer(writer);
 
         return self;
     }
@@ -149,15 +142,19 @@ const Editor = struct {
 
     pub fn delete(self: *Self) !void {
         var current_line = &self.buffer.items[self.cursor_y];
+        while (current_line.items.len < self.cursor_x) self.cursor_x -= 1;
         //var above_line = &self.buffer.items[self.cursor_y-1];
         if (self.cursor_x != 0) {
             self.cursor_x -= 1;
             _ = current_line.orderedRemove(self.cursor_x);
-        } else if (current_line.items.len == 0 and self.buffer.items.len > 1) {
+        } else if (self.buffer.items.len > 1) {
+            if (current_line.items.len != 0) {
+                try self.buffer.items[self.cursor_y - 1].appendSlice(current_line.items);
+            }
             if (self.cursor_y != 0) {
-                self.cursor_x = self.buffer.items[self.cursor_y - 1].items.len;
+                self.cursor_x = self.buffer.items[self.cursor_y - 1].items.len - current_line.items.len;
+                self.buffer.items[self.cursor_y].deinit();
                 _ = self.buffer.orderedRemove(self.cursor_y);
-                current_line.deinit();
                 self.cursor_y -= 1;
             }
             if (self.line_count != 0) {
@@ -168,12 +165,21 @@ const Editor = struct {
 
     pub fn insert(self: *Self, char: u8) !void {
         var current_line = &self.buffer.items[self.cursor_y];
-        try current_line.insert(self.cursor_x,char);
+        while (current_line.items.len < self.cursor_x) try current_line.append(' ');
+        try current_line.insert(self.cursor_x, char);
         self.cursor_x += 1;
     }
 
     pub fn newline(self: *Self) !void {
         try self.buffer.insert(self.cursor_y + 1, std.ArrayList(u8).init(self.allocator));
+        var current_line = &self.buffer.items[self.cursor_y];
+        var new_line = &self.buffer.items[self.cursor_y + 1];
+        if (self.cursor_x < current_line.items.len) {
+            try new_line.appendSlice(current_line.items[self.cursor_x..]);
+            for (self.cursor_x..current_line.items.len) |_| {
+                _ = current_line.pop();
+            }
+        }
         self.line_count += 1;
         self.cursor_y += 1;
         self.cursor_x = 0;
@@ -198,6 +204,21 @@ const Editor = struct {
         return result;
     }
 
+    pub fn draw_buffer(self: *Self, writer: anytype) !void {
+        try writer.print("{s}{s}", .{ Self.ClearScreen, Self.ResetCursor });
+        try self.get_tty_size();
+        for (self.buffer.items) |line| {
+            const limit = if (line.items.len > self.tty_w) self.tty_w else line.items.len;
+            try writer.print("{s}\r\n", .{line.items[0..limit]});
+        }
+        try Self.tty_cursor_move(writer, self.tty_h+1, 0);
+        const status_line_fmt = try std.fmt.allocPrint(self.allocator,"CURSOR POS: {d}x {d}y | TTY SIZE: {d}x {d}y | BUFFER SIZE: {d} | LINE COUNT: {d} | LINE LENGTH: {d}", .{ self.cursor_x, self.cursor_y, self.tty_w, self.tty_h, self.get_buffer_size(), self.line_count, self.get_line_length() });
+        defer self.allocator.free(status_line_fmt);
+        const status_line_max = if (status_line_fmt.len > self.tty_w) self.tty_w else status_line_fmt.len;
+        try writer.writeAll(status_line_fmt[0..status_line_max]);
+        try Self.tty_cursor_move(writer, self.cursor_y, self.cursor_x);
+    }
+
     pub fn loop(self: *Self) !void {
         const writer = self.tty.writer();
 
@@ -206,7 +227,7 @@ const Editor = struct {
             _ = try self.tty.read(&buffer);
 
             switch (buffer[0]) {
-                '\x1B' => {
+                '\x1B', '\x1F' => {
                     self.curr_termios.cc[os.system.V.TIME] = 1;
                     self.curr_termios.cc[os.system.V.MIN] = 0;
                     try os.tcsetattr(self.tty.handle, .NOW, self.curr_termios);
@@ -220,22 +241,24 @@ const Editor = struct {
 
                     if (esc_read == 0) {
                         break;
-                    }
-                    else if (mem.eql(u8, esc_buffer[0..esc_read], "[A")) {
+                    } else if (mem.eql(u8, esc_buffer[0..esc_read], "[A")) {
                         // TODO: add bounds here
-                        self.cursor_y += 1;
-                    }
-                    else if (mem.eql(u8, esc_buffer[0..esc_read], "[D")) {
+                        if (self.cursor_y != 0) {
+                            self.cursor_y -= 1;
+                        }
+                    } else if (mem.eql(u8, esc_buffer[0..esc_read], "[D")) {
                         // TODO: add bounds here
-                        self.cursor_x -= 1;
-                    }
-                    else if (mem.eql(u8, esc_buffer[0..esc_read], "[C")) {
+                        if (self.cursor_x != 0) {
+                            self.cursor_x -= 1;
+                        }
+                    } else if (mem.eql(u8, esc_buffer[0..esc_read], "[C")) {
                         // TODO: add bounds here
-                        self.cursor_x -= 1;
-                    }
-                    else if (mem.eql(u8, esc_buffer[0..esc_read], "[B")) {
+                        self.cursor_x += 1;
+                    } else if (mem.eql(u8, esc_buffer[0..esc_read], "[B")) {
                         // TODO: also add bounds here
-                        self.cursor_y += 1;
+                        if (self.cursor_y < self.buffer.items.len - 1) {
+                            self.cursor_y += 1;
+                        }
                     }
                 },
                 '\x1F' & 's' => try self.save_to_file(),
@@ -245,23 +268,20 @@ const Editor = struct {
                 '\x09' => try self.insertSlice("    "),
                 else => try self.insert(buffer[0]),
             }
-            try writer.print("{s}{s}", .{ Self.ClearScreen, Self.ResetCursor });
-            for (self.buffer.items) |line| {
-                try writer.print("{s}\r\n", .{line.items});
-            }
-            try self.get_tty_size();
-            try Self.tty_cursor_move(writer, self.tty_h, 0);
-            try writer.print("CURSOR POS: {d}x {d}y BUFFER SIZE: {d} LINE COUNT: {d} LINE LENGTH: {d}", .{ self.cursor_x, self.cursor_y, self.get_buffer_size(), self.line_count, self.get_line_length() });
-            try Self.tty_cursor_move(writer, self.cursor_y, self.cursor_x);
+            try self.draw_buffer(writer);
         }
     }
 };
 
 pub fn main() !void {
     //Allocator setup
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    //var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    //defer arena.deinit();
+    //const allocator = arena.allocator();
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
